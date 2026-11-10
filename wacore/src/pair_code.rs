@@ -218,6 +218,8 @@ pub enum PairCodeState {
     },
     /// Stage 1 complete - waiting for phone to confirm code entry.
     WaitingForPhoneConfirmation {
+        /// Opaque request identity retained for delayed flow observations.
+        claim: PairCodeClaim,
         /// Reference returned by server in stage 1.
         pairing_ref: Vec<u8>,
         /// Phone number JID (without @s.whatsapp.net).
@@ -1214,6 +1216,7 @@ mod tests {
 
     fn waiting_at(at_secs: u64) -> PairCodeState {
         PairCodeState::WaitingForPhoneConfirmation {
+            claim: PairCodeClaim::next(),
             pairing_ref: b"3@2:ref".to_vec(),
             phone_jid: "15551234567".to_string(),
             pair_code: "ABCD1234".to_string(),

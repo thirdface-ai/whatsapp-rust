@@ -1684,6 +1684,10 @@ pub struct PairingQrCode {
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct PairingCode {
+    /// Opaque identity captured from the affected flow before retirement.
+    /// Absent when the producer cannot attribute this observation to a flow.
+    #[serde(skip)]
+    pub flow_id: Option<crate::pair_code::PairCodeClaim>,
     /// The 8-character pairing code to display.
     pub code: String,
     /// Approximate validity duration (~180 seconds).
@@ -1704,6 +1708,10 @@ pub struct PairingCode {
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct PairingCodeRefresh {
+    /// Opaque identity captured from the affected flow before retirement.
+    /// Absent when the producer cannot attribute this observation to a flow.
+    #[serde(skip)]
+    pub flow_id: Option<crate::pair_code::PairCodeClaim>,
     /// `true` when the server set `force_manual_refresh` — the code must be
     /// re-requested explicitly rather than auto-rotated.
     pub force_manual: bool,
@@ -1757,6 +1765,10 @@ pub struct PairingCodeRefresh {
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct PairingCodeError {
+    /// Opaque identity captured from the affected flow before retirement.
+    /// Absent when the producer cannot attribute this observation to a flow.
+    #[serde(skip)]
+    pub flow_id: Option<crate::pair_code::PairCodeClaim>,
     /// The server's refusal, when it answered with one. `None` when the failure
     /// was local (validation, no connection) or the request went unanswered
     /// (timeout) — nothing was refused, so there is no status to report.
@@ -3160,6 +3172,32 @@ pub struct CallLogHistory {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    #[test]
+    fn pairing_flow_metadata_does_not_change_serialized_payloads() {
+        let claim = crate::pair_code::PairCodeClaim::next();
+        let code = PairingCode::builder()
+            .flow_id(claim)
+            .code("ABCD1234".into())
+            .timeout(std::time::Duration::from_secs(180))
+            .build();
+        let refresh = PairingCodeRefresh::builder()
+            .flow_id(claim)
+            .force_manual(true)
+            .build();
+        let error = PairingCodeError::builder()
+            .flow_id(claim)
+            .error("synthetic refusal".into())
+            .build();
+        for value in [
+            serde_json::to_value(code).unwrap(),
+            serde_json::to_value(refresh).unwrap(),
+            serde_json::to_value(error).unwrap(),
+        ] {
+            assert!(value.get("flow_id").is_none());
+        }
+        let legacy = PairingCodeRefresh::builder().force_manual(false).build();
+        assert_eq!(legacy.flow_id, None);
+    }
     use super::*;
     use buffa::Message;
     use waproto::whatsapp as wa;
