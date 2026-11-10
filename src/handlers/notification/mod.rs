@@ -639,6 +639,7 @@ mod tests {
         let client = create_test_client().await;
         let expired = wacore::time::Instant::ZERO;
         *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
+            claim: wacore::pair_code::PairCodeClaim::next(),
             pairing_ref: b"3@2:ref".to_vec(),
             phone_jid: "15551234567".to_string(),
             pair_code: "ABCD1234".to_string(),
@@ -673,6 +674,7 @@ mod tests {
 
         let client = create_test_client().await;
         *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
+            claim: wacore::pair_code::PairCodeClaim::next(),
             pairing_ref: b"3@2:ref".to_vec(),
             phone_jid: "15551234567".to_string(),
             pair_code: "ABCD1234".to_string(),

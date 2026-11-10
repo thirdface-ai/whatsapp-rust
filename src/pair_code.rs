@@ -473,6 +473,7 @@ impl Client {
                 return Err(PairCodeError::Cancelled.into());
             }
             *state = PairCodeState::WaitingForPhoneConfirmation {
+                claim,
                 pairing_ref,
                 phone_jid: phone_number,
                 pair_code: code.clone(),
@@ -491,6 +492,7 @@ impl Client {
         self.core.event_bus.dispatch(Event::PairingCode(
             crate::types::events::PairingCode::builder()
                 .code(code.clone())
+                .flow_id(claim)
                 .timeout(remaining)
                 .build(),
         ));
@@ -694,6 +696,7 @@ async fn handle_primary_hello(
             ephemeral_keypair,
             code_expires_at,
             primary_hello_attempt_count,
+            ..
         } => {
             // Validate before counting: only a genuine, in-window attempt
             // (matching ref, unexpired code) may spend a retry slot, so a
@@ -950,9 +953,9 @@ async fn report_stage_two_failure(
     }
 
     error!(target: "Client/PairCode", "companion_finish failed: {error}");
-    if !retire_stage_two_flow(client, pairing_ref, attempt, shutdown).await {
+    let Some(flow_id) = retire_stage_two_flow(client, pairing_ref, attempt, shutdown).await else {
         return;
-    }
+    };
     if shutdown.is_fired() || client.shutdown_signal().is_fired() {
         return;
     }
@@ -960,6 +963,7 @@ async fn report_stage_two_failure(
     let error = PairError::from(error);
     client.core.event_bus.dispatch(Event::PairingCodeError(
         crate::types::events::PairingCodeError::builder()
+            .flow_id(flow_id)
             .maybe_rejection(error.rejection())
             .maybe_backoff(error.backoff())
             .error(error.to_string())
@@ -1029,9 +1033,11 @@ fn pair_success_timeout(
         if shutdown.is_fired() || connection_shutdown.is_fired() {
             return;
         }
-        if !retire_stage_two_flow_locked(&client, state, &pairing_ref, attempt).await {
+        let Some(flow_id) =
+            retire_stage_two_flow_locked(&client, state, &pairing_ref, attempt).await
+        else {
             return;
-        }
+        };
         if shutdown.is_fired() || connection_shutdown.is_fired() {
             return;
         }
@@ -1042,6 +1048,7 @@ fn pair_success_timeout(
         );
         client.core.event_bus.dispatch(Event::PairingCodeRefresh(
             crate::types::events::PairingCodeRefresh::builder()
+                .flow_id(flow_id)
                 .force_manual(false)
                 .build(),
         ));
@@ -1063,10 +1070,10 @@ async fn retire_stage_two_flow(
     pairing_ref: &[u8],
     attempt: u32,
     shutdown: &wacore::runtime::ShutdownSignal,
-) -> bool {
+) -> Option<wacore::pair_code::PairCodeClaim> {
     let state = client.pair_code_state.lock().await;
     if shutdown.is_fired() || client.shutdown_signal().is_fired() {
-        return false;
+        return None;
     }
     retire_stage_two_flow_locked(client, state, pairing_ref, attempt).await
 }
@@ -1076,26 +1083,23 @@ async fn retire_stage_two_flow_locked(
     mut state: async_lock::MutexGuard<'_, PairCodeState>,
     pairing_ref: &[u8],
     attempt: u32,
-) -> bool {
-    let still_ours = matches!(
-        &*state,
+) -> Option<wacore::pair_code::PairCodeClaim> {
+    let claim = match &*state {
         PairCodeState::WaitingForPhoneConfirmation {
             pairing_ref: r,
             primary_hello_attempt_count,
+            claim,
             ..
-        } if r.as_slice() == pairing_ref
-            && *primary_hello_attempt_count == attempt
-    );
-    if !still_ours {
-        return false;
-    }
+        } if r.as_slice() == pairing_ref && *primary_hello_attempt_count == attempt => *claim,
+        _ => return None,
+    };
     *state = PairCodeState::Idle;
     // Under the same guard that retired the flow. `handle_pair_success` takes
     // this lock too, so releasing it first would open a window where a late
     // pair-success completes against the old secret and this then overwrites
     // the secret of a device that just paired.
     replace_adv_secret_key(client).await;
-    true
+    Some(claim)
 }
 
 /// Re-mint the device's adv secret because the flow that rotated it is dead.
@@ -1160,28 +1164,26 @@ async fn handle_refresh_code(
     // the old flow standing would make `pair_with_code` reject it. WA Web does
     // the same, re-running `initializeAltDeviceLinking()` on the
     // `force_manual_refresh` path.
-    let matches_current = {
+    let retired = {
         let mut state_guard = client.pair_code_state.lock().await;
         if shutdown.is_fired() || client.shutdown_signal().is_fired() {
             return true;
         }
-        let matches = matches!(
-            &*state_guard,
-            PairCodeState::WaitingForPhoneConfirmation { pairing_ref, .. }
-                if pairing_ref.as_slice() == notif_ref.as_slice()
-        );
-        if matches {
+        let claim = match &*state_guard {
+            PairCodeState::WaitingForPhoneConfirmation {
+                pairing_ref, claim, ..
+            } if pairing_ref.as_slice() == notif_ref.as_slice() => Some(*claim),
+            _ => None,
+        };
+        if claim.is_some() {
             *state_guard = PairCodeState::Idle;
         }
-        matches
+        claim
     };
-    if !matches_current {
-        warn!(
-            target: "Client/PairCode",
-            "refresh_code ref does not match the outstanding request; ignoring"
-        );
+    let Some(flow_id) = retired else {
+        warn!(target: "Client/PairCode", "refresh_code ref does not match the outstanding request; ignoring");
         return false;
-    }
+    };
 
     info!(
         target: "Client/PairCode",
@@ -1189,6 +1191,7 @@ async fn handle_refresh_code(
     );
     client.core.event_bus.dispatch(Event::PairingCodeRefresh(
         crate::types::events::PairingCodeRefresh::builder()
+            .flow_id(flow_id)
             .force_manual(force_manual)
             .build(),
     ));
@@ -1616,6 +1619,13 @@ mod tests {
         wacore::time::Instant::ZERO
     }
 
+    async fn waiting_claim(client: &Arc<Client>) -> wacore::pair_code::PairCodeClaim {
+        match &*client.pair_code_state.lock().await {
+            PairCodeState::WaitingForPhoneConfirmation { claim, .. } => *claim,
+            _ => panic!("expected a waiting flow"),
+        }
+    }
+
     async fn set_waiting(
         client: &Arc<Client>,
         pairing_ref: Vec<u8>,
@@ -1623,6 +1633,7 @@ mod tests {
         count: u32,
     ) {
         *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
+            claim: wacore::pair_code::PairCodeClaim::next(),
             pairing_ref,
             phone_jid: "15551234567".to_string(),
             pair_code: "ABCD1234".to_string(),
@@ -1810,6 +1821,7 @@ mod tests {
         let pairing_ref = vec![5, 6, 7, 8];
         set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
+        let claim = waiting_claim(&client).await;
         let notif = refresh_code_notif(&pairing_ref, Some(true));
         let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
 
@@ -1818,7 +1830,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if r.force_manual)),
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if r.force_manual && r.flow_id == Some(claim))),
             "expected PairingCodeRefresh{{force_manual:true}}, got: {events:?}"
         );
     }
@@ -1835,6 +1847,7 @@ mod tests {
         let pairing_ref = vec![5, 6, 7, 8];
         set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
+        let claim = waiting_claim(&client).await;
         let notif = refresh_code_notif(&pairing_ref, None);
         let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
 
@@ -1842,7 +1855,7 @@ mod tests {
         assert!(
             collector.events().iter().any(|e| matches!(
                 &**e,
-                Event::PairingCodeRefresh(r) if !r.force_manual
+                Event::PairingCodeRefresh(r) if !r.force_manual && r.flow_id == Some(claim)
             )),
             "absent force_manual_refresh must dispatch force_manual: false"
         );
@@ -2055,6 +2068,7 @@ mod tests {
         let pairing_ref = vec![1, 2, 3, 4];
         reach_stage_two(&client, &transport, &pairing_ref).await;
         let adv_after_stage_two = adv(&client);
+        let claim = waiting_claim(&client).await;
 
         answer_companion_finish(&client, &transport, 0, Some((400, "bad-request"))).await;
 
@@ -2073,6 +2087,7 @@ mod tests {
                 _ => None,
             })
             .expect("the refusal was just observed");
+        assert_eq!(reported.flow_id, Some(claim));
         assert_eq!(
             reported.rejection,
             Some(PairCodeRejection::BadRequest),
@@ -2087,6 +2102,36 @@ mod tests {
             adv_after_stage_two,
             "the secret this dead flow rotated must not outlive it"
         );
+    }
+
+    /// Replacing the slot after retirement must not change the identity carried
+    /// to dispatch. This is the unlocked boundary shared by watchdog/refusal.
+    #[tokio::test]
+    async fn retired_flow_identity_survives_a_replacement_before_dispatch() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let old_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, old_ref.clone(), live_window(), 1).await;
+        let old_claim = waiting_claim(&client).await;
+        let retired =
+            retire_stage_two_flow(&client, &old_ref, 1, &client.connection_shutdown_signal())
+                .await
+                .expect("the old flow owns the slot");
+        set_waiting(&client, vec![5, 6, 7, 8], live_window(), 0).await;
+        let replacement = waiting_claim(&client).await;
+        client.core.event_bus.dispatch(Event::PairingCodeRefresh(
+            crate::types::events::PairingCodeRefresh::builder()
+                .flow_id(retired)
+                .force_manual(false)
+                .build(),
+        ));
+        assert_ne!(old_claim, replacement);
+        assert!(collector.events().iter().any(|event| matches!(
+            &**event, Event::PairingCodeRefresh(event)
+                if event.flow_id == Some(old_claim) && event.flow_id != Some(replacement)
+        )));
+        assert_eq!(waiting_claim(&client).await, replacement);
     }
 
     /// A refusal that arrives for a flow already replaced belongs to nobody:
@@ -2163,6 +2208,7 @@ mod tests {
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
         reach_stage_two(&client, &transport, &[1, 2, 3, 4]).await;
+        let claim = waiting_claim(&client).await;
 
         advance_past(PairCodeUtils::companion_finish_iq_timeout()).await;
         for _ in 0..64 {
@@ -2185,7 +2231,7 @@ mod tests {
             collector
                 .events()
                 .iter()
-                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if !r.force_manual))
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if !r.force_manual && r.flow_id == Some(claim)))
         })
         .await;
     }
@@ -2253,6 +2299,8 @@ mod tests {
     #[tokio::test]
     async fn cancel_pair_code_lets_a_replacement_be_requested() {
         let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
         set_waiting(&client, vec![1, 2, 3, 4], live_window(), 0).await;
 
         client.cancel_pair_code().await;
@@ -2267,6 +2315,10 @@ mod tests {
             .expect("the pair-code task should not panic")
             .expect("a cancelled flow leaves the way clear");
         assert!(PairCodeUtils::validate_code(&code));
+        let claim = waiting_claim(&client).await;
+        assert!(collector.events().iter().any(|event| matches!(
+            &**event, Event::PairingCode(event) if event.flow_id == Some(claim)
+        )));
     }
 
     /// An expired code strands nobody — its holder cannot complete it either —
